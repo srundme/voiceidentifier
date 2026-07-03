@@ -177,7 +177,11 @@ async def identify(
 # Authenticate endpoint (Orchestration)
 @app.post("/authenticate")
 async def authenticate(audio: UploadFile = File(...)):
-    print("STEP 1 - Endpoint reached", flush=True)
+    print("STEP 1", flush=True)
+    temp_path = TEMP_DIR / audio.filename
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(audio.file, buffer)
+    print("STEP 2 - File Saved", flush=True)
     return {
-        "status": "working"
+        "status": "file_saved"
     }
