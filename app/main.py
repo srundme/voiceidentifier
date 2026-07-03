@@ -180,52 +180,83 @@ async def authenticate(
     audio: UploadFile = File(...)
 ) -> dict:
     """Automatic Customer Voice Identity Service endpoint."""
+    import time
+    import traceback
+
+    print("========== START /authenticate ==========")
+    t_total_start = time.time()
     temp_path = TEMP_DIR / audio.filename
     try:
+        # -------------------- 1️⃣ Save uploaded file --------------------
+        t_start = time.time()
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(audio.file, buffer)
-            
-        # 1. Voice Activity Detection (VAD)
+        t_save = time.time()
+        print(f"[Timing] Saving uploaded file: {t_save - t_start:.4f}s")
+
+        # -------------------- 2️⃣ Voice Activity Detection (VAD) --------------------
+        t_start = time.time()
         waveform, sr = vad_processor.load_audio(temp_path)
+        t_load = time.time()
+        print(f"[Timing] load_audio(): {t_load - t_start:.4f}s")
+
+        t_start = time.time()
         speech_waveform = vad_processor.remove_silence(waveform, sr)
-        
+        t_vad = time.time()
+        print(f"[Timing] remove_silence(): {t_vad - t_start:.4f}s")
+
         duration_seconds = len(speech_waveform) / sr
         if duration_seconds < 15.0:
             return {
                 "status": "insufficient_audio",
                 "message": "Need at least 15 seconds of clear speech."
             }
-            
-        # 2. Generate Embedding
-        # We reuse the processed speech waveform to avoid decoding the file twice
+
+        # -------------------- Debug info for the processed waveform --------------------
+        print(f"type(speech_waveform): {type(speech_waveform)}")
+        print(f"speech_waveform.shape: {speech_waveform.shape}")
+        print(f"speech_waveform.dtype: {speech_waveform.dtype}")
+        print(f"sr: {sr}")
+
+        # -------------------- 3️⃣ Generate Embedding (reuse waveform) --------------------
+        t_start = time.time()
         embedding = generate_embedding_from_waveform(speech_waveform, sr)
-        
-        # 3. Use in-memory cache
-        # 4. Cosine Similarity Search
+        t_embed = time.time()
+        print(f"[Timing] generate_embedding_from_waveform(): {t_embed - t_start:.4f}s")
+
+        # -------------------- 4️⃣ Cosine similarity search --------------------
+        t_start = time.time()
         best_name = None
         best_sim = 0.0
-        
+
         if speaker_embeddings_cache:
             for name, emb in speaker_embeddings_cache.items():
                 norm_a = np.linalg.norm(embedding)
                 norm_b = np.linalg.norm(emb)
-                sim = float(np.dot(embedding, emb) / (norm_a * norm_b)) if norm_a and norm_b else 0.0
+                sim = (
+                    float(np.dot(embedding, emb) / (norm_a * norm_b))
+                    if norm_a and norm_b
+                    else 0.0
+                )
                 if sim > best_sim:
                     best_sim = sim
                     best_name = name
-                    
+
         threshold = DEFAULT_THRESHOLD
-        
-        # 5. Decision Matrix
+        t_sim = time.time()
+        print(f"[Timing] speaker similarity search: {t_sim - t_start:.4f}s")
+
+        # -------------------- 5️⃣ Decision matrix (customer handling) --------------------
+        t_start = time.time()
         if best_name and best_sim >= threshold:
             # Existing Customer
             customer = customer_manager.update_customer(best_name)
-            return {
+            response = {
                 "customer_id": best_name,
                 "existing_customer": True,
                 "similarity": round(best_sim * 100, 2),
                 "call_count": customer.get("call_count", 1),
-                "status": "existing_customer"
+                "status": "existing_customer",
             }
         else:
             # Unknown Speaker / New Customer
@@ -233,21 +264,36 @@ async def authenticate(
             save_path = SPEAKER_DB_DIR / f"{new_id}.npy"
             np.save(save_path, embedding)
             speaker_embeddings_cache[new_id] = embedding
-            
+
             customer = customer_manager.create_customer(new_id)
-            return {
+            response = {
                 "customer_id": new_id,
                 "existing_customer": False,
                 "similarity": round(best_sim * 100, 2) if best_name else 0.0,
                 "call_count": customer.get("call_count", 1),
-                "status": "new_customer"
+                "status": "new_customer",
             }
-            
+        t_cust = time.time()
+        print(f"[Timing] customer creation/update: {t_cust - t_start:.4f}s")
+
+        # -------------------- Return response --------------------
+        t_start = time.time()
+        t_resp = time.time()  # essentially instantaneous
+        print(f"[Timing] returning the response: {t_resp - t_start:.4f}s")
+        print(
+            f"========== END /authenticate (Total: {time.time() - t_total_start:.4f}s) =========="
+        )
+        return response
+
     except Exception as exc:
+        # Full traceback for Railway debugging
+        print("========== AUTHENTICATE ERROR ==========")
+        traceback.print_exc()
+        print("========================================")
         raise HTTPException(status_code=500, detail=str(exc))
+
     finally:
+        # Clean up temporary file
         temp_path.unlink(missing_ok=True)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
