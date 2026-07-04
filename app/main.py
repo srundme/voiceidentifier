@@ -16,6 +16,7 @@ from constants import DEFAULT_THRESHOLD
 from fastapi.middleware.cors import CORSMiddleware
 import vad_processor
 from app import customer_manager
+from app.gender_service import predict_gender
 
 app = FastAPI(title="Voice Authentication API", version="0.1.0")
 
@@ -175,60 +176,124 @@ async def identify(
         temp_path.unlink(missing_ok=True)
 
 # Authenticate endpoint (Orchestration)
-@app.post("/authenticate")
-async def authenticate(audio: UploadFile = File(...)):
-    print("STEP 1", flush=True)
+@app.post("/authenticate", response_class=JSONResponse)
+async def authenticate(audio: UploadFile = File(...)) -> dict:
+    """Automatic Customer Voice Identity Service endpoint."""
+    import time
+    
+    total_start = time.perf_counter()
     temp_path = TEMP_DIR / audio.filename
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(audio.file, buffer)
-    print("STEP 2 - File Saved", flush=True)
-    waveform, sr = vad_processor.load_audio(temp_path)
-    print("STEP 3 - Audio Loaded", flush=True)
-    speech_waveform = vad_processor.remove_silence(waveform, sr)
-    print("STEP 4 - Silence Removed", flush=True)
-    duration_seconds = len(speech_waveform) / sr
-    print(f"Speech Duration: {duration_seconds:.2f} seconds", flush=True)
 
-    print("STEP 5 - Starting embedding generation", flush=True)
     try:
+        # Save the uploaded file
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(audio.file, buffer)
+            
+        # 1. Check if we have any enrolled speakers at all
+        if not speaker_embeddings_cache:
+            processing_time_ms = (time.perf_counter() - total_start) * 1000.0
+            return {
+                "status": "warning",
+                "existing_customer": False,
+                "authentication_result": "NO_REGISTERED_SPEAKERS",
+                "similarity": 0.0,
+                "processing_time_ms": round(processing_time_ms, 2),
+                "message": "No enrolled speakers found in the system."
+            }
+
+        # 2. VAD & Audio Loading
+        waveform, sr = vad_processor.load_audio(temp_path)
+        speech_waveform = vad_processor.remove_silence(waveform, sr)
+        
+        duration_seconds = len(speech_waveform) / sr
+        if duration_seconds < 15.0:
+            processing_time_ms = (time.perf_counter() - total_start) * 1000.0
+            return {
+                "status": "error",
+                "authentication_result": "INSUFFICIENT_AUDIO",
+                "required_duration_seconds": 15.0,
+                "received_duration_seconds": round(duration_seconds, 2),
+                "processing_time_ms": round(processing_time_ms, 2),
+                "message": "Need at least 15 seconds of clear speech."
+            }
+
+        # 3. Generate the embedding
         embedding = generate_embedding_from_waveform(speech_waveform, sr)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"Embedding Error: {e}", flush=True)
-        raise
 
-    print("STEP 6 - Embedding generated", flush=True)
-    print(f"Embedding shape: {embedding.shape}", flush=True)
+        # 3.5 Predict Gender (Optional, non-blocking)
+        gender_res = predict_gender(str(temp_path))
+        predicted_gender = gender_res.get("gender", "Unknown")
+        gender_confidence = gender_res.get("confidence", 0.0)
 
-    print("STEP 6 - Starting similarity search", flush=True)
-    try:
+        # 4. Cosine similarity search
         best_name = None
         best_sim = 0.0
-        if speaker_embeddings_cache:
-            for name, emb in speaker_embeddings_cache.items():
-                norm_a = np.linalg.norm(embedding)
-                norm_b = np.linalg.norm(emb)
-                sim = (
-                    float(np.dot(embedding, emb) / (norm_a * norm_b))
-                    if norm_a and norm_b
-                    else 0.0
-                )
-                if sim > best_sim:
-                    best_sim = sim
-                    best_name = name
-    except Exception as e:
+        
+        for name, emb in speaker_embeddings_cache.items():
+            norm_a = np.linalg.norm(embedding)
+            norm_b = np.linalg.norm(emb)
+            sim = (
+                float(np.dot(embedding, emb) / (norm_a * norm_b))
+                if norm_a and norm_b
+                else 0.0
+            )
+            if sim > best_sim:
+                best_sim = sim
+                best_name = name
+                
+        threshold = DEFAULT_THRESHOLD
+
+        # 5. Customer resolution
+        if best_name and best_sim >= threshold:
+            # Existing Customer Match
+            customer = customer_manager.update_customer(best_name)
+            processing_time_ms = (time.perf_counter() - total_start) * 1000.0
+            return {
+                "status": "success",
+                "existing_customer": True,
+                "customer_id": best_name,
+                "customer_name": customer.get("name") if customer else None,
+                "similarity": round(best_sim * 100, 2),
+                "threshold": threshold,
+                "authentication_result": "AUTHENTICATED",
+                "call_count": customer.get("call_count", 1) if customer else 1,
+                "processing_time_ms": round(processing_time_ms, 2),
+                "message": "Customer authenticated successfully.",
+                "predicted_gender": predicted_gender,
+                "gender_confidence": gender_confidence
+            }
+        else:
+            # New Customer Registration
+            new_id = customer_manager.generate_customer_id()
+            save_path = SPEAKER_DB_DIR / f"{new_id}.npy"
+            np.save(save_path, embedding)
+            speaker_embeddings_cache[new_id] = embedding
+            customer = customer_manager.create_customer(new_id)
+            
+            processing_time_ms = (time.perf_counter() - total_start) * 1000.0
+            return {
+                "status": "success",
+                "existing_customer": False,
+                "customer_id": new_id,
+                "similarity": round(best_sim * 100, 2) if best_name else 0.0,
+                "threshold": threshold,
+                "authentication_result": "NEW_SPEAKER_ENROLLED",
+                "call_count": customer.get("call_count", 1) if customer else 1,
+                "processing_time_ms": round(processing_time_ms, 2),
+                "message": "New customer enrolled successfully.",
+                "predicted_gender": predicted_gender,
+                "gender_confidence": gender_confidence
+            }
+
+    except Exception as exc:
+        processing_time_ms = (time.perf_counter() - total_start) * 1000.0
         import traceback
         traceback.print_exc()
-        print(f"Similarity Error: {e}", flush=True)
-        raise
-
-    print("STEP 7 - Similarity search complete", flush=True)
-    print(f"Best speaker: {best_name}", flush=True)
-    print(f"Best similarity: {best_sim}", flush=True)
-
-    return {
-        "status": "similarity_completed",
-        "best_name": best_name,
-        "similarity": float(best_sim)
-    }
+        return {
+            "status": "error",
+            "authentication_result": "INTERNAL_SERVER_ERROR",
+            "processing_time_ms": round(processing_time_ms, 2),
+            "message": str(exc)
+        }
+    finally:
+        temp_path.unlink(missing_ok=True)
