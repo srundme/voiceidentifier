@@ -16,7 +16,7 @@ from constants import DEFAULT_THRESHOLD
 from fastapi.middleware.cors import CORSMiddleware
 import vad_processor
 from app import customer_manager
-from app.gender_service import predict_gender
+
 
 app = FastAPI(title="Voice Authentication API", version="0.1.0")
 
@@ -220,10 +220,7 @@ async def authenticate(audio: UploadFile = File(...)) -> dict:
         # 3. Generate the embedding
         embedding = generate_embedding_from_waveform(speech_waveform, sr)
 
-        # 3.5 Predict Gender (Optional, non-blocking)
-        gender_res = predict_gender(str(temp_path))
-        predicted_gender = gender_res.get("gender", "Unknown")
-        gender_confidence = gender_res.get("confidence", 0.0)
+
 
         # 4. Cosine similarity search
         best_name = None
@@ -258,9 +255,7 @@ async def authenticate(audio: UploadFile = File(...)) -> dict:
                 "authentication_result": "AUTHENTICATED",
                 "call_count": customer.get("call_count", 1) if customer else 1,
                 "processing_time_ms": round(processing_time_ms, 2),
-                "message": "Customer authenticated successfully.",
-                "predicted_gender": predicted_gender,
-                "gender_confidence": gender_confidence
+                "message": "Customer authenticated successfully."
             }
         else:
             # New Customer Registration
@@ -280,9 +275,7 @@ async def authenticate(audio: UploadFile = File(...)) -> dict:
                 "authentication_result": "NEW_SPEAKER_ENROLLED",
                 "call_count": customer.get("call_count", 1) if customer else 1,
                 "processing_time_ms": round(processing_time_ms, 2),
-                "message": "New customer enrolled successfully.",
-                "predicted_gender": predicted_gender,
-                "gender_confidence": gender_confidence
+                "message": "New customer enrolled successfully."
             }
 
     except Exception as exc:
