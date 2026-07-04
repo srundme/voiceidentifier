@@ -201,7 +201,34 @@ async def authenticate(audio: UploadFile = File(...)):
     print("STEP 6 - Embedding generated", flush=True)
     print(f"Embedding shape: {embedding.shape}", flush=True)
 
+    print("STEP 6 - Starting similarity search", flush=True)
+    try:
+        best_name = None
+        best_sim = 0.0
+        if speaker_embeddings_cache:
+            for name, emb in speaker_embeddings_cache.items():
+                norm_a = np.linalg.norm(embedding)
+                norm_b = np.linalg.norm(emb)
+                sim = (
+                    float(np.dot(embedding, emb) / (norm_a * norm_b))
+                    if norm_a and norm_b
+                    else 0.0
+                )
+                if sim > best_sim:
+                    best_sim = sim
+                    best_name = name
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"Similarity Error: {e}", flush=True)
+        raise
+
+    print("STEP 7 - Similarity search complete", flush=True)
+    print(f"Best speaker: {best_name}", flush=True)
+    print(f"Best similarity: {best_sim}", flush=True)
+
     return {
-        "status": "embedding_generated",
-        "dimension": int(embedding.shape[0])
+        "status": "similarity_completed",
+        "best_name": best_name,
+        "similarity": float(best_sim)
     }
