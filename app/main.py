@@ -46,8 +46,26 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 @app.on_event("startup")
 async def startup_event():
-    # Automatically create database tables during FastAPI startup
-    Base.metadata.create_all(bind=engine)
+    import sys
+    from sqlalchemy import text
+    try:
+        print("[DB] Connecting to PostgreSQL...", flush=True)
+        # Create extension if not exists
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+        print("[DB] pgvector extension verified.", flush=True)
+        
+        print("[DB] Creating database tables...", flush=True)
+        # Automatically create database tables during FastAPI startup
+        Base.metadata.create_all(bind=engine)
+        print("[DB] Database initialization completed successfully.", flush=True)
+    except Exception as exc:
+        import traceback
+        print("=" * 80, flush=True)
+        print("DATABASE INITIALIZATION FAILED", flush=True)
+        traceback.print_exc()
+        print("=" * 80, flush=True)
+        sys.exit(1)
 
 @app.get("/", response_class=JSONResponse)
 async def root() -> dict:
