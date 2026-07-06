@@ -25,6 +25,7 @@ from app import customer_manager
 from sqlalchemy.orm import Session
 from app.database import Base, engine, get_db
 from app import crud
+from app.audio_adapter import pcm_to_wav, pcm_bytes_to_numpy
 
 app = FastAPI(title="Voice Authentication API", version="0.1.0")
 
@@ -411,3 +412,169 @@ async def authenticate(
         }
     finally:
         temp_path.unlink(missing_ok=True)
+
+# PCM Telephony endpoint
+@app.post("/authenticate/pcm", response_class=JSONResponse)
+async def authenticate_pcm(
+    audio: UploadFile = File(..., description="Raw PCM file: 16-bit signed little-endian, 8kHz mono"),
+    db: Session = Depends(get_db)
+) -> dict:
+    """
+    Telephony-optimised authentication endpoint.
+
+    Accepts raw PCM audio (16-bit signed little-endian, 8 kHz, mono) from a
+    telephony platform, converts it to WAV via the Audio Adapter layer, then
+    runs the same VAD + embedding + similarity pipeline as /authenticate.
+
+    The /authenticate endpoint is NOT touched by this endpoint.
+    """
+    total_start = time.perf_counter()
+    # Use a .wav suffix so vad_processor/soundfile can read it correctly
+    temp_pcm_path = TEMP_DIR / (audio.filename + ".pcm.tmp")
+    temp_wav_path = TEMP_DIR / (audio.filename + ".wav")
+
+    try:
+        # 1. Read the raw PCM bytes from the upload
+        pcm_bytes = await audio.read()
+        if not pcm_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded PCM file is empty.")
+
+        # 2. Convert PCM -> WAV via Audio Adapter
+        pcm_to_wav(pcm_bytes, temp_wav_path, sample_rate=8000, channels=1, sample_width=2)
+
+        # 3. Fetch all embeddings from PostgreSQL
+        all_embeddings = crud.get_all_embeddings(db)
+
+        if not all_embeddings:
+            processing_time_ms = (time.perf_counter() - total_start) * 1000.0
+            return {
+                "status": "warning",
+                "existing_customer": False,
+                "authentication_result": "NO_REGISTERED_SPEAKERS",
+                "similarity": 0.0,
+                "processing_time_ms": round(processing_time_ms, 2),
+                "audio_duration": 0.0,
+                "audio_format": "PCM_8KHZ",
+                "message": "No enrolled speakers found in the system."
+            }
+
+        # 4. VAD & Audio Loading (reuse existing vad_processor pipeline)
+        waveform, sr = vad_processor.load_audio(temp_wav_path)
+        speech_waveform = vad_processor.remove_silence(waveform, sr)
+
+        duration_seconds = len(speech_waveform) / sr
+        if duration_seconds < 15.0:
+            processing_time_ms = (time.perf_counter() - total_start) * 1000.0
+            return {
+                "status": "error",
+                "authentication_result": "INSUFFICIENT_AUDIO",
+                "required_duration_seconds": 15.0,
+                "received_duration_seconds": round(duration_seconds, 2),
+                "processing_time_ms": round(processing_time_ms, 2),
+                "audio_format": "PCM_8KHZ",
+                "message": "Need at least 15 seconds of clear speech."
+            }
+
+        # 5. Generate embedding
+        embedding = generate_embedding_from_waveform(speech_waveform, sr)
+
+        # 6. Cosine similarity search
+        best_name = None
+        best_customer_id = None
+        best_sim = 0.0
+
+        for row in all_embeddings:
+            emb = np.array(row.embedding)
+            norm_a = np.linalg.norm(embedding)
+            norm_b = np.linalg.norm(emb)
+            sim = (
+                float(np.dot(embedding, emb) / (norm_a * norm_b))
+                if norm_a and norm_b
+                else 0.0
+            )
+            if sim > best_sim:
+                best_sim = sim
+                best_customer_id = row.customer_id
+                best_name = row.customer_name
+
+        threshold = DEFAULT_THRESHOLD
+        authenticated = best_customer_id is not None and best_sim >= threshold
+
+        processing_time_ms = (time.perf_counter() - total_start) * 1000.0
+        current_timestamp = datetime.utcnow().isoformat()
+
+        if authenticated:
+            # Save authentication log
+            crud.save_authentication_log(
+                db=db,
+                customer_id=best_customer_id,
+                similarity=best_sim,
+                threshold=threshold,
+                authenticated=True,
+                processing_time_ms=processing_time_ms,
+                audio_duration=duration_seconds
+            )
+            matched_customer = crud.get_customer_by_id(db, best_customer_id)
+            matched_embedding_count = len(matched_customer.voice_embeddings) if matched_customer else 0
+
+            return {
+                "status": "success",
+                "existing_customer": True,
+                "customer_id": str(best_customer_id),
+                "customer_name": best_name,
+                "authentication_result": "AUTHENTICATED",
+                "similarity": round(best_sim * 100, 2),
+                "threshold": threshold,
+                "processing_time_ms": round(processing_time_ms, 2),
+                "audio_duration": round(duration_seconds, 2),
+                "matched_embedding_count": matched_embedding_count,
+                "model": "ECAPA-TDNN",
+                "audio_format": "PCM_8KHZ",
+                "timestamp": current_timestamp,
+                "message": "Speaker authenticated successfully."
+            }
+        else:
+            # Auto-create new customer
+            existing_customers = crud.get_all_customers(db)
+            next_num = len(existing_customers) + 1
+            new_customer_name = f"CUSTOMER_{next_num:06d}"
+            while crud.get_customer_by_name(db, new_customer_name) is not None:
+                next_num += 1
+                new_customer_name = f"CUSTOMER_{next_num:06d}"
+
+            new_customer = crud.create_customer(db, new_customer_name)
+            crud.save_embedding(
+                db=db,
+                customer_id=new_customer.customer_id,
+                embedding=embedding,
+                sample_rate=sr,
+                audio_duration=duration_seconds
+            )
+
+            return {
+                "status": "success",
+                "existing_customer": False,
+                "new_customer_created": True,
+                "customer_id": str(new_customer.customer_id),
+                "customer_name": new_customer.customer_name,
+                "authentication_result": "NEW_CUSTOMER_CREATED",
+                "audio_format": "PCM_8KHZ",
+                "message": "New customer created successfully."
+            }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        processing_time_ms = (time.perf_counter() - total_start) * 1000.0
+        import traceback
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "authentication_result": "INTERNAL_SERVER_ERROR",
+            "processing_time_ms": round(processing_time_ms, 2),
+            "audio_format": "PCM_8KHZ",
+            "message": str(exc)
+        }
+    finally:
+        temp_pcm_path.unlink(missing_ok=True)
+        temp_wav_path.unlink(missing_ok=True)
