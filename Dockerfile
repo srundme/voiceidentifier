@@ -26,9 +26,14 @@ WORKDIR /app
 # Copy requirements first for Docker layer caching
 COPY requirements.txt .
 
-# Upgrade pip, then install all deps
-RUN pip install --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+# Upgrade pip
+RUN pip install --upgrade pip
+
+# Install CPU-only PyTorch and Torchaudio first to save 2GB+ space and speed up Railway builds
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Install the remaining requirements
+RUN pip install --no-cache-dir -r requirements.txt
 
 # ----- Copy project files -----
 COPY . .
